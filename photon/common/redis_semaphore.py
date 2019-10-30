@@ -35,6 +35,7 @@ class Semaphore:
 
         local timeout = tonumber(timeout_str)
         local sleep = tonumber(sleep_str)
+        local set_name  = semaphore_name .. ".set"
         local queue_name = semaphore_name .. ".queue"
         -- get the 1st & 2nd entries
         local queue_entries = redis.call("lrange", queue_name, 0, 1)
@@ -71,7 +72,7 @@ class Semaphore:
         -- part 2: is there enough total value remaining to acquire our requested value?
         local del_sem_iids = {}
         local acquired_value_total = 0  -- TODO: consider caching the total
-        for index, iid in next, redis.call("smembers", semaphore_name) do
+        for index, iid in next, redis.call("smembers", set_name) do
             local sem_name_iid = semaphore_name .. ".iid:" .. iid
             local acquired_value_sem_iid = redis.call("get", sem_name_iid)
 
@@ -83,7 +84,7 @@ class Semaphore:
         end
 
         for index, iid in next, del_sem_iids do  -- delete expired iids from the set
-            redis.call("srem", semaphore_name, iid)
+            redis.call("srem", set_name, iid)
         end
 
         local requested_value = tonumber(requested_value_str)
@@ -97,8 +98,8 @@ class Semaphore:
 
         -- part 3: Acquire the requested value and update data structures
         redis.call("set", head_sem_name_iid, requested_value, "px", timeout)
-        redis.call("sadd", semaphore_name, sem_iid)
-        redis.call("pexpire", semaphore_name, timeout)
+        redis.call("sadd", set_name, sem_iid)
+        redis.call("pexpire", set_name, timeout)
         redis.call("lpop", queue_name)
 
         if next_sem_iid then  -- if there actually IS an entry set it up
