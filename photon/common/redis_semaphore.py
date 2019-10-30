@@ -116,11 +116,12 @@ class Semaphore:
         local semaphore_name = KEYS[1]
         local sem_iid = ARGV[1]
 
+        local set_name  = semaphore_name .. ".set"
         local sem_name_iid = semaphore_name .. ".iid:" .. sem_iid
         local released_value_str = redis.call("get", sem_name_iid)
         local released_value = tonumber(released_value_str)
         redis.call("del", sem_name_iid)  -- delete the key/value entry for this iid
-        redis.call("srem", semaphore_name, sem_iid)  -- remove the iid from the set
+        redis.call("srem", set_name, sem_iid)  -- remove the iid from the semaphore set
 
         if released_value then
             return released_value
