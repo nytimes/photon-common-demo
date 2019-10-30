@@ -4,6 +4,7 @@ from pathlib import Path
 
 from redis import Redis
 
+from photon.common.redis_semaphore import Semaphore
 from photon.common.config_context_common import ConfigContextCommon
 
 
@@ -25,3 +26,33 @@ class RedisCommon(object):
         redis_port = int(os.environ.get("REDISPORT", 6379))
         self._redis = Redis(host=redis_host, port=redis_port)
         self._au_key = f"app:{config.PACKAGE_NICKNAME}.util:{config.util_cmd}"
+        self._semaphore_value = 100
+        self._semaphore_timeout = 60 * 60  # an hour
+        self._semaphore_name = "default"
+
+    def get_semaphore(
+        self, name: str = "", value: int = 0, timeout: int = 0, sleep: float = 0.1
+    ) -> Semaphore:
+        """
+        Initialize a redis-based distributed multi-process/multi-thread
+        Semaphore object for this application/utility and instance.
+
+        Args:
+            name: The shared name of the semaphore.
+            timeout: Duration until expiration.
+            sleep: The seconds to sleep between polls
+                   when trying to acquire the semaphore.
+
+        Returns:
+            A Semaphore object for acquire() & release() or use as a context mgr (with).
+        """
+        name = name or self._semaphore_name
+        aus_key = f"{self._au_key}.semaphore:{name}"
+        timeout = timeout or self._semaphore_timeout
+        value = value or self._semaphore_value
+
+        semaphore = Semaphore(
+            self._redis, name=aus_key, value=value, timeout=timeout, sleep=sleep
+        )
+
+        return semaphore
