@@ -37,13 +37,15 @@ class Semaphore:
         local sleep = tonumber(sleep_str)
         local set_name  = semaphore_name .. ".set"
         local queue_name = semaphore_name .. ".queue"
-        -- get the 1st & 2nd entries
+
+        -- get the 1st & 2nd queue entries
         local queue_entries = redis.call("lrange", queue_name, 0, 1)
         local head_sem_iid = queue_entries[1]  -- the 1st is the head entry
         local next_sem_iid = queue_entries[2]  -- the 2nd is the next entry
         local head_sem_name_iid = semaphore_name .. ".iid:" .. head_sem_iid
 
         redis.call("pexpire", queue_name, timeout)  -- extend the life of the queue
+        redis.call("pexpire", set_name, timeout)  -- and the set, if it exists
 
         -- part 1: is the head entry "dead"? are we at the head of the acquire queue?
         local exists = redis.call("exists", head_sem_name_iid)  -- check expiration
@@ -57,20 +59,20 @@ class Semaphore:
             end
 
             if head_sem_iid == sem_iid then  -- oops! The expired head is us...
-                return -2  -- ...so raise an exception
+                return -2  -- ...raise an exception
             end
         end
 
-        -- so head entry must still exist...
+        -- head entry must still exist...
         if head_sem_iid ~= sem_iid then   -- but we are not yet at the head of the queue
             redis.call("pexpire", head_sem_name_iid, sleep * 100)  -- extend expiration
-            return -1  -- ...so go around again
+            return -1  -- ...go around again
         end
 
-        -- ...and we ARE at the head of the queue
+        -- ...we ARE at the head of the queue
 
         -- part 2: is there enough total value remaining to acquire our requested value?
-        local del_sem_iids = {}
+        local rem_sem_iids = {}
         local acquired_value_total = 0  -- TODO: consider caching the total
         for index, iid in next, redis.call("smembers", set_name) do
             local sem_name_iid = semaphore_name .. ".iid:" .. iid
@@ -78,12 +80,12 @@ class Semaphore:
 
             if acquired_value_sem_iid then  -- accumulate the acquired_value
                 acquired_value_total = acquired_value_total + acquired_value_sem_iid
-            else
-                table.insert(del_sem_iids, iid)  -- oops that iid has expired
+            else  -- oops that iid has expired
+                table.insert(rem_sem_iids, iid)
             end
         end
 
-        for index, iid in next, del_sem_iids do  -- delete expired iids from the set
+        for index, iid in next, rem_sem_iids do  -- remove expired iids from the set
             redis.call("srem", set_name, iid)
         end
 
@@ -99,7 +101,7 @@ class Semaphore:
         -- part 3: Acquire the requested value and update data structures
         redis.call("set", head_sem_name_iid, requested_value, "px", timeout)
         redis.call("sadd", set_name, sem_iid)
-        redis.call("pexpire", set_name, timeout)
+        redis.call("pexpire", set_name, timeout)  -- set may have been empty previously
         redis.call("lpop", queue_name)
 
         if next_sem_iid then  -- if there actually IS an entry set it up
@@ -145,7 +147,7 @@ class Semaphore:
         Args:
             redis: The redis client
 
-            name: the name to use for the RLock.
+            name: the name to use for the Semaphore.
 
             timeout: The maximum inactivity for the Semaphore in seconds.
 
@@ -175,7 +177,7 @@ class Semaphore:
 
     def _register_scripts(self) -> None:
         """
-        Register the lua scripts once for the class (including all RLock instances).
+        Register the lua scripts once for the class (including all Semaphore instances).
 
         """
         cls = self.__class__
