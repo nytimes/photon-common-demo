@@ -1,11 +1,11 @@
 import os
 import logging
-from typing import List
 from pathlib import Path
+from typing import List, Optional
 
 from redis import Redis
 
-from photon.common.redis_semaphore import Semaphore
+from photon.common.redis_semaphore import ParamsNT, Semaphore
 from photon.common.config_context_common import ConfigContextCommon
 
 
@@ -26,39 +26,51 @@ class RedisCommon(object):
         redis_host = os.environ.get("REDISHOST", "localhost")
         redis_port = int(os.environ.get("REDISPORT", 6379))
         self._redis = Redis(host=redis_host, port=redis_port)
-        self._au_key = f"app:{config.PACKAGE_NICKNAME}.util:{config.util_cmd}"
-        self._semaphore_value = 100
-        self._semaphore_timeout = 60 * 60  # an hour
-        self._semaphore_name = "default"
+        self._app_key = f"app:{config.PACKAGE_NICKNAME}"
         self._semaphores: List[Semaphore] = []
 
-    def get_semaphore(
-        self, name: str = "", value: int = 0, timeout: int = 0, sleep: float = 0.1
-    ) -> Semaphore:
+    def get_semaphore(self, name: str = "default") -> Semaphore:
         """
         Initialize a redis-based distributed multi-process/multi-thread
         Semaphore object for the calling thread.
 
         Args:
             name: The shared name of the semaphore.
-            timeout: Duration until expiration.
-            sleep: The seconds to sleep between polls
-                   when trying to acquire the semaphore.
 
         Returns:
             A Semaphore object for acquire() & release() or use as a context mgr (with).
         """
-        name = name or self._semaphore_name
-        aus_key = f"{self._au_key}.semaphore:{name}"
-        timeout = timeout or self._semaphore_timeout
-        value = value or self._semaphore_value
-
-        semaphore = Semaphore(
-            self._redis, name=aus_key, value=value, timeout=timeout, sleep=sleep
-        )
-
+        app_sem_key = f"{self._app_key}.semaphore:{name}"
+        semaphore = Semaphore(self._redis, name=app_sem_key)
         self._semaphores.append(semaphore)
+
         return semaphore
+
+    def get_semaphore_params(self, name: str = "default") -> Optional[ParamsNT]:
+        """
+        Proxy to Semaphore get_params() static method
+
+        """
+        return Semaphore.get_params(self._redis, name=name)
+
+    def set_semaphore_params(
+        self,
+        name: str = "default",
+        capacity: int = 100,
+        timeoutms: int = 60 * 60 * 1000,
+        sleepms: int = 100,
+    ) -> None:
+        """
+        Proxy to Semaphore set_params() static method
+
+        """
+        Semaphore.set_params(
+            self._redis,
+            name=name,
+            capacity=capacity,
+            timeoutms=timeoutms,
+            sleepms=sleepms,
+        )
 
     def failfast(self) -> None:
         """

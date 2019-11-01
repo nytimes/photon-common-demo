@@ -1,9 +1,20 @@
 import time
 import uuid
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple, Optional
 
 from redis import Redis
 from redis.exceptions import LockError
+
+
+class ParamsNT(NamedTuple):
+    capacity: int
+    timeoutms: int
+    sleepms: int
+
+
+ParamsNT.capacity.__doc__ = "bool (field 0): The workload capacity of the Semaphore"
+ParamsNT.timeoutms.__doc__ = "bool (field 1): The maximum inactivity in milliseconds."
+ParamsNT.sleepms.__doc__ = "int (field 2): The spin interval in milliseconds"
 
 
 class Semaphore:
@@ -29,14 +40,22 @@ class Semaphore:
         local semaphore_name = KEYS[1]
         local sem_iid = ARGV[1]
         local requested_value_str = ARGV[2]
-        local max_value_str = ARGV[3]
-        local timeout_str = ARGV[4]
-        local sleep_str = ARGV[5]
 
-        local timeout = tonumber(timeout_str)
-        local sleep = tonumber(sleep_str)
         local set_name  = semaphore_name .. ".set"
         local queue_name = semaphore_name .. ".queue"
+        local params_name = semaphore_name .. ".params"
+
+        local capacity_str = redis.call("hget", params_name, "capacity")
+        local timeoutms_str = redis.call("hget", params_name, "timeoutms")
+        local sleepms_str = redis.call("hget", params_name, "sleepms")
+
+        if not (capacity_str and timeoutms_str and sleepms_str) then
+            return -3 -- oops! params have not been set - raise an exception
+        end
+
+        local capacity = tonumber(capacity_str)
+        local timeoutms = tonumber(timeoutms_str)
+        local sleepms = tonumber(sleepms_str)
 
         -- get the 1st & 2nd queue entries
         local queue_entries = redis.call("lrange", queue_name, 0, 1)
@@ -44,18 +63,18 @@ class Semaphore:
         local next_sem_iid = queue_entries[2]  -- the 2nd is the next entry
         local head_sem_name_iid = semaphore_name .. ".iid:" .. head_sem_iid
 
-        redis.call("pexpire", queue_name, timeout)  -- extend the life of the queue
-        redis.call("pexpire", set_name, timeout)  -- and the set, if it exists
+        redis.call("pexpire", queue_name, timeoutms)  -- extend the life of the queue
+        redis.call("pexpire", set_name, timeoutms)  -- and the set, if it exists
 
         -- part 1: is the head entry "dead"? are we at the head of the acquire queue?
-        local exists = redis.call("exists", head_sem_name_iid)  -- check expiration
+        local head_exists = redis.call("exists", head_sem_name_iid)  -- check expiration
 
-        if exists == 0 then  -- oops the head entry has expired - app died?
+        if head_exists == 0 then  -- oops the head entry has expired - app died?
             redis.call("lpop", queue_name)  -- bye bye
 
             if next_sem_iid then  -- if there actually IS an entry set it up
                 local next_sem_name_iid = semaphore_name .. ".iid:" .. next_sem_iid
-                redis.call("set", next_sem_name_iid, 0, "px", sleep * 100)
+                redis.call("set", next_sem_name_iid, 0, "px", sleepms * 10)
             end
 
             if head_sem_iid == sem_iid then  -- oops! The expired head is us...
@@ -65,7 +84,7 @@ class Semaphore:
 
         -- head entry must still exist...
         if head_sem_iid ~= sem_iid then   -- but we are not yet at the head of the queue
-            redis.call("pexpire", head_sem_name_iid, sleep * 100)  -- extend expiration
+            redis.call("pexpire", head_sem_name_iid, sleepms * 10)
             return -1  -- ...go around again
         end
 
@@ -90,23 +109,23 @@ class Semaphore:
         end
 
         local requested_value = tonumber(requested_value_str)
-        local max_value = tonumber(max_value_str)
+        local capacity = tonumber(capacity_str)
 
-        if requested_value > (max_value - acquired_value_total) then
+        if requested_value > (capacity - acquired_value_total) then
             -- not enough value yet so app must call us again soon
-            redis.call("pexpire", head_sem_name_iid, sleep * 100)  -- extend expiration
+            redis.call("pexpire", head_sem_name_iid, sleepms * 10)
             return 0  -- the requested value is not yet available so go around again
         end
 
         -- part 3: Acquire the requested value and update data structures
-        redis.call("set", head_sem_name_iid, requested_value, "px", timeout)
+        redis.call("set", head_sem_name_iid, requested_value, "px", timeoutms)
         redis.call("sadd", set_name, sem_iid)
-        redis.call("pexpire", set_name, timeout)  -- set may have been empty previously
+        redis.call("pexpire", set_name, timeoutms)  -- may have been empty previously
         redis.call("lpop", queue_name)
 
         if next_sem_iid then  -- if there actually IS an entry set it up
             local next_sem_name_iid = semaphore_name .. ".iid:" .. next_sem_iid
-            redis.call("set", next_sem_name_iid, 0, "px", sleep * 100)
+            redis.call("set", next_sem_name_iid, 0, "px", sleepms * 10)
         end
 
         return requested_value  -- got it!
@@ -133,47 +152,96 @@ class Semaphore:
         end
     """
 
-    def __init__(
-        self,
-        redis: Redis,
-        name: str,
-        value: int = 100,
-        timeout: int = 3600,
-        sleep: float = 0.1,
-    ) -> None:
+    def __init__(self, redis: Redis, name: str = "default") -> None:
         """
         Create a new Semaphore instance named ``name`` using the Redis client.
+
+        The client may call get_params() to verify that capacity, timeout, and sleep
+        are set appropriately. set_params() may be called to reset them.
 
         Args:
             redis: The redis client
 
-            name: the name to use for the Semaphore.
+            name: The name to use for the Semaphore.
 
-            timeout: The maximum inactivity for the Semaphore in seconds.
+        """
 
-            sleep: The amount of time in seconds to sleep per loop iteration
+        paramsnt = Semaphore.get_params(redis, name)
+
+        if not paramsnt:
+            raise ValueError(
+                f"params are not yet initialized in Redis for Semaphore: '{name}'"
+            )
+
+        self._redis = redis
+        self._name = name
+        self._capacity = paramsnt.capacity
+        self._sleepms = paramsnt.sleepms
+        self._queue_name = f"{name}.queue"
+        self._sem_iid = str(uuid.uuid1())
+        self._acquired_value = 0
+        self._register_scripts()
+
+    @staticmethod
+    def get_params(redis: Redis, name: str = "default") -> Optional[ParamsNT]:
+        """
+        Get the params for a Semaphore named ``name``.
+
+        Args:
+            redis: A Redis instance
+
+            name: The name of the Semaphore.
+
+        Returns:
+            A ParamsNT imnstance or None if not found.
+
+        """
+        params_name = f"{name}.params"
+        paramsbd = redis.hgetall(params_name)  # type: ignore
+
+        if paramsbd:
+            paramsd = {k.decode(): int(v) for k, v in paramsbd.items()}
+            return ParamsNT(**paramsd)
+        else:
+            return None
+
+    @staticmethod
+    def set_params(
+        redis: Redis,
+        name: str = "default",
+        capacity: int = 100,
+        timeoutms: int = 60 * 60 * 1000,
+        sleepms: int = 100,
+    ) -> None:
+        """
+        Set the params for a Semaphore named ``name``.
+
+        Args:
+            redis: A Redis instance
+
+            name: The name of the Semaphore.
+
+            capacity: The workload capacity of the Semaphore
+
+            timeoutms: The maximum inactivity for the Semaphore in milliseconds.
+
+            sleepms: The amount of time in milliseconds to sleep per loop iteration
             when acquire() is not possible because the requested value is
             not yet available.
 
         """
-        self._redis = redis
+        if capacity < 1:
+            raise ValueError("'capacity' must be greater than 0")
 
-        if timeout <= 0:
-            raise ValueError("'timeout' must be greater than 0")
+        if timeoutms < 1:
+            raise ValueError("'timeoutms' must be greater than 0")
 
-        if sleep > timeout:
+        if sleepms >= timeoutms:
             raise ValueError("'sleep' must be less than 'timeout'")
 
-        self._sleep = sleep
-        self._sleepms = int(sleep * 1000)
-        self._timeoutms = timeout * 1000
-        self._name = name
-        self._queue_name = f"{name}.queue"
-        self._max_value = value
-        self._sem_iid = str(uuid.uuid1())
-        self._acquired_value = 0
-        self._register_scripts()
-        # TODO: store the instance parameters in Redis as a hash associated w sem_iid
+        params_name = f"{name}.params"
+        paramsd = {"capacity": capacity, "sleepms": sleepms, "timeoutms": timeoutms}
+        redis.hmset(params_name, paramsd)  # type: ignore  # no expiration
 
     def _register_scripts(self) -> None:
         """
@@ -210,10 +278,10 @@ class Semaphore:
             LockError.
 
         """
-        if requested_value < 1 or requested_value > self._max_value:
+        if requested_value < 1 or requested_value > self._capacity:
             raise ValueError(
                 f"'requested_value' must be between 1 and "
-                f"'max_value': {self._max_value}"
+                f"'capacity': {self._capacity}"
             )
 
         if self._acquired_value:
@@ -231,13 +299,7 @@ class Semaphore:
         while True:  # spin until acquired
             self._acquired_value = self.lua_acquire(
                 keys=[self._name],
-                args=[
-                    self._sem_iid,
-                    requested_value,
-                    self._max_value,
-                    self._timeoutms,
-                    self._sleepms,
-                ],
+                args=[self._sem_iid, requested_value],
                 client=self._redis,
             )
 
@@ -247,8 +309,10 @@ class Semaphore:
             if self._acquired_value == -2:
                 raise LockError("Semaphore queue entry timed out")
 
-            # return values of 0 and -1 -> spin again after sleeping
-            time.sleep(self._sleep)
+            if self._acquired_value == -3:
+                raise LockError("Semaphore params not found in Redis")
+
+            time.sleep(self._sleepms / 1000)  # sleep then spin
 
     def release(self) -> int:
         """
