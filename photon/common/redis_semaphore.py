@@ -44,6 +44,8 @@ class Semaphore:
         local set_name  = semaphore_name .. ".set"
         local queue_name = semaphore_name .. ".queue"
         local params_name = semaphore_name .. ".params"
+        local value_key = semaphore_name .. ".acquired_value"
+        local requested_value = tonumber(requested_value_str)
 
         local capacity_str = redis.call("hget", params_name, "capacity")
         local timeoutms_str = redis.call("hget", params_name, "timeoutms")
@@ -57,78 +59,127 @@ class Semaphore:
         local timeoutms = tonumber(timeoutms_str)
         local sleepms = tonumber(sleepms_str)
 
-        -- get the 1st & 2nd queue entries
-        local queue_entries = redis.call("lrange", queue_name, 0, 1)
-        local head_sem_iid = queue_entries[1]  -- the 1st is the head entry
-        local next_sem_iid = queue_entries[2]  -- the 2nd is the next entry
-        local head_sem_name_iid = semaphore_name .. ".iid:" .. head_sem_iid
-
         redis.call("pexpire", queue_name, timeoutms)  -- extend the life of the queue
         redis.call("pexpire", set_name, timeoutms)  -- and the set, if it exists
 
-        -- part 1: is the head entry "dead"? are we at the head of the acquire queue?
-        local head_exists = redis.call("exists", head_sem_name_iid)  -- check expiration
+        local function get_queue_entries(semaphore_name, queue_name, sleepms)
+            local queue_entries = redis.call("lrange", queue_name, 0, 1)
+            local head_sem_iid = queue_entries[1]  -- the 1st is the head entry
+            local next_sem_iid = queue_entries[2]  -- the 2nd is the next entry
+            local head_sem_name_iid = semaphore_name .. ".iid:" .. head_sem_iid
 
-        if head_exists == 0 then  -- oops the head entry has expired - app died?
-            redis.call("lpop", queue_name)  -- bye bye
+            local rc = 0
+            local head_exists = redis.call("exists", head_sem_name_iid)
+            if head_exists == 0 then  -- oops the head entry has expired - app died?
+                redis.call("lpop", queue_name)  -- bye bye
+
+                if next_sem_iid then  -- if there actually IS an entry set it up
+                    local next_sem_name_iid = semaphore_name .. ".iid:" .. next_sem_iid
+                    redis.call("set", next_sem_name_iid, 0, "px", sleepms * 10)
+                end
+
+                if head_sem_iid == sem_iid then  -- oops! The expired head is us...
+                    rc = -2  -- ...raise an exception
+                else  -- it's not us
+                    rc = -1  -- go around again
+                end
+            else  -- head entry still exists...
+                if head_sem_iid == sem_iid then   -- ...we ARE at the head of the queue!
+                    rc = 0
+                else  -- ...but we are not yet at the head of the queue
+                    redis.call("pexpire", head_sem_name_iid, sleepms * 10)
+                    rc = -1  -- go around again
+                end
+            end
+
+            return rc, head_sem_name_iid, next_sem_iid
+        end
+
+        local function calculate_acquired_value_total(set_name)
+            local rem_sem_iids = {}
+            local acquired_value_total = 0
+            for index, iid in next, redis.call("smembers", set_name) do
+                local sem_name_iid = semaphore_name .. ".iid:" .. iid
+                local acquired_value_sem_iid = redis.call("get", sem_name_iid)
+
+                if acquired_value_sem_iid then  -- accumulate the acquired_value
+                    acquired_value_total = acquired_value_total + acquired_value_sem_iid
+                else  -- oops that iid has expired
+                    table.insert(rem_sem_iids, iid)
+                end
+            end
+
+            for index, iid in next, rem_sem_iids do  -- remove expired iids from the set
+                redis.call("srem", set_name, iid)
+            end
+
+            return acquired_value_total
+        end
+
+        local function get_acquired_value_total(set_name, value_key, sleepms)
+            local acquired_value_total = redis.call("get", value_key)
+
+            if not acquired_value_total then
+                acquired_value_total = calculate_acquired_value_total(set_name)
+                redis.call("set", value_key, acquired_value_total, "px", sleepms * 10)
+            end
+
+            return acquired_value_total
+        end
+
+        local function check_value(
+            set_name, head_sem_name_iid, requested_value, capacity, sleepms
+        )
+            local acquired_value_total = get_acquired_value_total(
+                set_name, value_key, sleepms
+            )
+
+            local rc =  0
+            if requested_value > (capacity - acquired_value_total) then
+                redis.call("pexpire", head_sem_name_iid, sleepms * 10)
+                rc = 0  -- the requested value is not yet available - go around again
+            else
+                rc = requested_value  -- got it!
+            end
+
+            return rc
+        end
+
+        -- MAIN
+
+        -- are we at the head of the acquire queue?
+        local
+            rc,
+            head_sem_name_iid,
+            next_sem_iid = get_queue_entries(semaphore_name, queue_name, sleepms)
+
+        if rc < 0 then  -- we are not at the head
+            return rc  -- -1 or -2
+        end
+
+        -- we are at the head
+        -- is there enough total value remaining to acquire our requested value?
+        rc = check_value(
+            set_name, head_sem_name_iid, requested_value, capacity, sleepms
+        )
+
+        if rc > 0 then  -- acquire the requested value and update data structures
+            redis.call("set", head_sem_name_iid, rc, "px", timeoutms)
+            redis.call("sadd", set_name, sem_iid)
+            redis.call("pexpire", set_name, timeoutms)  -- may have been empty
+            redis.call("lpop", queue_name)
+
+            if redis.call("exists", value_key) == 1 then
+                redis.call("incrby", value_key, rc)
+            end
 
             if next_sem_iid then  -- if there actually IS an entry set it up
                 local next_sem_name_iid = semaphore_name .. ".iid:" .. next_sem_iid
                 redis.call("set", next_sem_name_iid, 0, "px", sleepms * 10)
             end
-
-            if head_sem_iid == sem_iid then  -- oops! The expired head is us...
-                return -2  -- ...raise an exception
-            end
         end
 
-        -- head entry must still exist...
-        if head_sem_iid ~= sem_iid then   -- but we are not yet at the head of the queue
-            redis.call("pexpire", head_sem_name_iid, sleepms * 10)
-            return -1  -- ...go around again
-        end
-
-        -- ...we ARE at the head of the queue
-
-        -- part 2: is there enough total value remaining to acquire our requested value?
-        local rem_sem_iids = {}
-        local acquired_value_total = 0  -- TODO: consider caching the total
-        for index, iid in next, redis.call("smembers", set_name) do
-            local sem_name_iid = semaphore_name .. ".iid:" .. iid
-            local acquired_value_sem_iid = redis.call("get", sem_name_iid)
-
-            if acquired_value_sem_iid then  -- accumulate the acquired_value
-                acquired_value_total = acquired_value_total + acquired_value_sem_iid
-            else  -- oops that iid has expired
-                table.insert(rem_sem_iids, iid)
-            end
-        end
-
-        for index, iid in next, rem_sem_iids do  -- remove expired iids from the set
-            redis.call("srem", set_name, iid)
-        end
-
-        local requested_value = tonumber(requested_value_str)
-        local capacity = tonumber(capacity_str)
-
-        if requested_value > (capacity - acquired_value_total) then
-            -- not enough value yet so app must call us again soon
-            redis.call("pexpire", head_sem_name_iid, sleepms * 10)
-            return 0  -- the requested value is not yet available so go around again
-        end
-
-        -- part 3: Acquire the requested value and update data structures
-        redis.call("set", head_sem_name_iid, requested_value, "px", timeoutms)
-        redis.call("sadd", set_name, sem_iid)
-        redis.call("pexpire", set_name, timeoutms)  -- may have been empty previously
-        redis.call("lpop", queue_name)
-
-        if next_sem_iid then  -- if there actually IS an entry set it up
-            local next_sem_name_iid = semaphore_name .. ".iid:" .. next_sem_iid
-            redis.call("set", next_sem_name_iid, 0, "px", sleepms * 10)
-        end
-
-        return requested_value  -- got it!
+        return rc  -- 0 or requested_value
     """
 
     # KEYS[1] - semaphore name
@@ -140,16 +191,27 @@ class Semaphore:
 
         local set_name  = semaphore_name .. ".set"
         local sem_name_iid = semaphore_name .. ".iid:" .. sem_iid
+        local value_key = semaphore_name .. ".acquired_value"
+
         local released_value_str = redis.call("get", sem_name_iid)
         local released_value = tonumber(released_value_str)
+
+        local rc = 0
+        if released_value then
+            local acquired_value_total_str = redis.call("get", value_key)
+            local acquired_value_total = tonumber(acquired_value_total_str)
+
+            if acquired_value_total and acquired_value_total >= released_value then
+                redis.call("incrby", value_key, -released_value)
+            end
+
+            rc = released_value
+        end
+
         redis.call("del", sem_name_iid)  -- delete the key/value entry for this iid
         redis.call("srem", set_name, sem_iid)  -- remove the iid from the semaphore set
 
-        if released_value then
-            return released_value
-        else
-            return 0
-        end
+        return rc
     """
 
     def __init__(self, redis: Redis, name: str = "default") -> None:
