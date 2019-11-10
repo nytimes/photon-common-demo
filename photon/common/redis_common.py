@@ -58,6 +58,7 @@ class RedisCommon(object):
         name: str = "default",
         capacity: int = 100,
         timeoutms: int = 60 * 60 * 1000,
+        decay: float = 0.9999,
         sleepms: int = 100,
     ) -> None:
         """
@@ -70,6 +71,7 @@ class RedisCommon(object):
             capacity=capacity,
             timeoutms=timeoutms,
             sleepms=sleepms,
+            decay=decay,
         )
 
     def failfast(self) -> None:

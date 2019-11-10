@@ -1,6 +1,6 @@
 import time
 import uuid
-from typing import Any, Callable, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional
 
 from redis import Redis
 from redis.exceptions import LockError
@@ -10,11 +10,13 @@ class ParamsNT(NamedTuple):
     capacity: int
     timeoutms: int
     sleepms: int
+    decay: float
 
 
 ParamsNT.capacity.__doc__ = "bool (field 0): The workload capacity of the Semaphore"
 ParamsNT.timeoutms.__doc__ = "bool (field 1): The maximum inactivity in milliseconds."
 ParamsNT.sleepms.__doc__ = "int (field 2): The spin interval in milliseconds"
+ParamsNT.decay.__doc__ = "float (field 3): The decay factor per interval"
 
 
 class Semaphore:
@@ -31,40 +33,41 @@ class Semaphore:
     # KEYS[1] - semaphore name
     # ARGV[1] - semaphore instance id
     # ARGV[2] - requested value
-    # return the acquired value otherwise 0 if cannot yet acquire
+    # return the acquired value and the score (priority)
+    # acquired value = 0 if cannot yet acquire
     LUA_ACQUIRE_SCRIPT = """
-        -- Note: before this is called an entry must exist in the queue
-        --       this is handled by the class but for debugging can be done manually
-        local semaphore_name = KEYS[1]
+        local name = KEYS[1]
         local iid = ARGV[1]
         local requested_value_str = ARGV[2]
 
-        local set_name  = semaphore_name .. ".set"
-        local zset_name = semaphore_name .. ".zset"
-        local params_name = semaphore_name .. ".params"
-        local value_key = semaphore_name .. ".acquired_value"
+        local set_name  = name .. ".set"
+        local zset_name = name .. ".zset"
+        local params_name = name .. ".params"
+        local value_key = name .. ".acquired_value"
         local requested_value = tonumber(requested_value_str)
 
         local capacity_str = redis.call("hget", params_name, "capacity")
         local timeoutms_str = redis.call("hget", params_name, "timeoutms")
         local sleepms_str = redis.call("hget", params_name, "sleepms")
+        local decay_str = redis.call("hget", params_name, "decay")
 
-        if not (capacity_str and timeoutms_str and sleepms_str) then
+        if not (capacity_str and timeoutms_str and sleepms_str and decay_str) then
             return -3, 0 -- oops! params have not been set - raise an exception
         end
 
         local capacity = tonumber(capacity_str)
         local timeoutms = tonumber(timeoutms_str)
         local sleepms = tonumber(sleepms_str)
+        local decay = tonumber(decay_str)
 
-        local function get_zset_entry(semaphore_name, zset_name, sleepms)
+        local function get_zset_entry(name, zset_name, sleepms)
             local head_iid = ""
             local zset_exists = redis.call("exists", zset_name)
 
             if zset_exists == 1 then
                 local iids = redis.call("zrange", zset_name, 0, 0)
                 head_iid = iids[1]
-                local head_name_iid = semaphore_name .. ".iid:" .. head_iid
+                local head_name_iid = name .. ".iid:" .. head_iid
                 local head_exists = redis.call("exists", head_name_iid)
 
                 if head_exists == 0 then  -- oops the head entry has expired - app died?
@@ -76,53 +79,52 @@ class Semaphore:
             return head_iid
         end
 
-        local function calculate_acquired_value_total(set_name)
-            local rem_iids = {}
+        local function calculate_acquired_value_total(name, set_name)
+            local purge_iids = {}  -- list of iids that have expired
             local acquired_value_total = 0
-            for index, iid in next, redis.call("smembers", set_name) do
-                local name_iid = semaphore_name .. ".iid:" .. iid
-                local acquired_value_iid = redis.call("get", name_iid)
+            for i, iid in next, redis.call("smembers", set_name) do
+                local name_iid = name .. ".iid:" .. iid
+                local value = redis.call("get", name_iid)
 
-                if acquired_value_iid then  -- accumulate the acquired_value
-                    acquired_value_total = acquired_value_total + acquired_value_iid
-                else  -- oops that iid has expired
-                    table.insert(rem_iids, iid)
+                if value then  -- accumulate the acquired_value
+                    acquired_value_total = acquired_value_total + value
+                else  -- oops that iid has expired, add to the purge list
+                    table.insert(purge_iids, iid)
                 end
             end
 
-            for index, iid in next, rem_iids do  -- remove expired iids from the set
+            for i, iid in next, purge_iids do  -- remove expired iids from the set
                 redis.call("srem", set_name, iid)
             end
 
             return acquired_value_total
         end
 
-        local function get_acquired_value_total(set_name, value_key, sleepms)
-            local acquired_value_total = redis.call("get", value_key)
+        local function get_acquired_value_total(name, set_name, value_key, sleepms)
+            local acquired_value_total = redis.call("get", value_key)  -- check cache
 
-            if not acquired_value_total then
-                acquired_value_total = calculate_acquired_value_total(set_name)
+            if not acquired_value_total then  -- cache has expired, recalculate & reset
+                acquired_value_total = calculate_acquired_value_total(name, set_name)
                 redis.call("set", value_key, acquired_value_total, "px", sleepms * 10)
             end
 
             return acquired_value_total
         end
 
-        local function get_acquired_value(
-            set_name, name_iid, requested_value, capacity, sleepms
+        local function try_to_acquire_value(
+            name, set_name, name_iid, requested_value, capacity, sleepms
         )
             local acquired_value_total = get_acquired_value_total(
-                set_name, value_key, sleepms
+                name, set_name, value_key, sleepms
             )
 
-            local acquired_value =  0
-            if requested_value > (capacity - acquired_value_total) then
-                acquired_value = 0  -- not yet available - go around again
-            else
-                acquired_value = requested_value  -- got it!
+            local acquired_value = 0
+
+            if requested_value <= (capacity - acquired_value_total) then
+                acquired_value = requested_value  -- YAY got it!
             end
 
-            return acquired_value
+            return acquired_value  -- either zero or the requested_value
         end
 
         -- MAIN
@@ -130,58 +132,57 @@ class Semaphore:
         redis.call("pexpire", set_name, timeoutms)  -- and the set, if they exist
 
         local score = redis.call("zscore", zset_name, iid)
-        local name_iid = semaphore_name .. ".iid:" .. iid
+        local name_iid = name .. ".iid:" .. iid
         local name_iid_exists = redis.call("exists", name_iid)
 
         -- the existential question
         if name_iid_exists == 0 or not score then    -- oops - app died?
             redis.call("zrem", zset_name, iid)  -- bye bye
-            redis.call("del", name_iid)  -- cleanup if necessary
             return {-2, 0}  -- raise an exception
         end
 
-        -- we exist!
+        -- we exist! (normal)
         -- are we at the head of the acquire zset (lowest score)?
-        local head_iid = get_zset_entry(semaphore_name, zset_name, sleepms)
+        local head_iid = get_zset_entry(name, zset_name, sleepms)
 
-        if iid ~= head_iid then  -- not at the head or head expired
-            -- exponentially decay the score of this entry to avoid starvation
-            score = score * 0.9999
+        if iid ~= head_iid then  -- we're not at the head or the head has expired
+            -- reduce our score to avoid starvation and crawl toward the head...
+            score = score * decay  -- exponential decay
             redis.call("zadd", zset_name, score, iid)  -- reset
             redis.call("pexpire", name_iid, sleepms * 100)  -- extend
-            return {-1, score}  -- go around again
+            return {-1, score}  -- go around again (normal)
         end
 
-        -- we are at the head
+        -- we ARE at the head! (normal - after a while...)
         -- is there enough total value remaining to acquire our requested value?
-        local acquired_value = get_acquired_value(
-            set_name, name_iid, requested_value, capacity, sleepms
+        local acquired_value = try_to_acquire_value(
+            name, set_name, name_iid, requested_value, capacity, sleepms
         )
 
-        if acquired_value > 0 then  -- update data structures
-            redis.call("set", name_iid, acquired_value, "px", timeoutms)
-            redis.call("sadd", set_name, iid)  -- create if necessary
-            redis.call("pexpire", set_name, timeoutms)  -- may have been empty
-            redis.call("zrem", zset_name, iid)
+        if acquired_value > 0 then  -- YES! got it! (normal - after a while longer...)
+            redis.call("set", name_iid, acquired_value, "px", timeoutms)  -- set value
+            redis.call("sadd", set_name, iid)  -- add us to the set of iid's w value
+            redis.call("pexpire", set_name, timeoutms)  -- (set may have been created)
+            redis.call("zrem", zset_name, iid)  -- remove us from the acquisition zset
 
-            if redis.call("exists", value_key) == 1 then
+            if redis.call("exists", value_key) == 1 then  -- increment the cache
                 redis.call("incrby", value_key, acquired_value)
             end
         end
 
-        return {acquired_value, score}
+        return {acquired_value, score}  -- acquired_value == requested_value OR zero
     """
 
     # KEYS[1] - semaphore name
     # ARGV[1] - instance id
     # return released value.
     LUA_RELEASE_SCRIPT = """
-        local semaphore_name = KEYS[1]
+        local name = KEYS[1]
         local iid = ARGV[1]
 
-        local set_name  = semaphore_name .. ".set"
-        local name_iid = semaphore_name .. ".iid:" .. iid
-        local value_key = semaphore_name .. ".acquired_value"
+        local set_name  = name .. ".set"
+        local name_iid = name .. ".iid:" .. iid
+        local value_key = name .. ".acquired_value"
 
         local acquired_value_str = redis.call("get", name_iid)
         local acquired_value = tonumber(acquired_value_str)
@@ -245,14 +246,18 @@ class Semaphore:
             name: The name of the Semaphore.
 
         Returns:
-            A ParamsNT imnstance or None if not found.
+            A ParamsNT instance or None if not found.
 
         """
         params_name = f"{name}.params"
         paramsbd = redis.hgetall(params_name)  # type: ignore
 
         if paramsbd:
-            paramsd = {k.decode(): int(v) for k, v in paramsbd.items()}
+            paramsd: Dict[str, Any] = {
+                k.decode(): int(v) for k, v in paramsbd.items() if k != b"decay"
+            }
+
+            paramsd["decay"] = float(paramsbd[b"decay"])
             return ParamsNT(**paramsd)
         else:
             return None
@@ -264,6 +269,7 @@ class Semaphore:
         capacity: int = 100,
         timeoutms: int = 60 * 60 * 1000,
         sleepms: int = 100,
+        decay: float = 0.9999,
     ) -> None:
         """
         Set the params for a Semaphore named ``name``.
@@ -281,6 +287,8 @@ class Semaphore:
             when acquire() is not possible because the requested value is
             not yet available.
 
+            decay: The decay factor per interval - helps avoid "starvation".
+
         """
         if capacity < 1:
             raise ValueError("'capacity' must be greater than 0")
@@ -291,8 +299,18 @@ class Semaphore:
         if sleepms >= timeoutms:
             raise ValueError("'sleep' must be less than 'timeout'")
 
+        if decay > 1.0 or decay < 0.999:
+            raise ValueError("'decay' must be between 0.999 and 1.000")
+
         params_name = f"{name}.params"
-        paramsd = {"capacity": capacity, "sleepms": sleepms, "timeoutms": timeoutms}
+
+        paramsd = {
+            "capacity": capacity,
+            "sleepms": sleepms,
+            "timeoutms": timeoutms,
+            "decay": decay,
+        }
+
         redis.hmset(params_name, paramsd)  # type: ignore  # no expiration
 
     def _register_scripts(self) -> None:
@@ -317,16 +335,15 @@ class Semaphore:
     def __exit__(self, *args: Any) -> None:
         self.release()
 
-    def acquire(self, requested_value: int = 1) -> Tuple[int, float]:
+    def acquire(self, requested_value: int = 1) -> float:
         """
         Use Redis to acquire a shared, distributed semaphore for this instanec_id
         and return when the semaphore is acquired with the requested value.
 
         Returns:
-            The acquired value.
+            The score incorporating exponential decay.
 
         Raises:
-            ValueError.
             LockError.
 
         """
@@ -356,7 +373,7 @@ class Semaphore:
             )
 
             if self._acquired_value > 0:
-                return self._acquired_value, float(score)
+                return float(score)
 
             if self._acquired_value == -2:
                 raise LockError("Semaphore queue entry timed out")
