@@ -335,7 +335,7 @@ class Semaphore:
     def __exit__(self, *args: Any) -> None:
         self.release()
 
-    def acquire(self, requested_value: int = 1) -> float:
+    def acquire(self, requested_value: int = 1, score: float = 0.0) -> float:
         """
         Use Redis to acquire a shared, distributed semaphore for this instanec_id
         and return when the semaphore is acquired with the requested value.
@@ -356,11 +356,17 @@ class Semaphore:
         if self._acquired_value:
             raise LockError("Cannot acquire an already acquired Semaphore instance")
 
+        if not score:
+            score = requested_value
+
+        if score < 0:
+            raise ValueError("'score' must be >= 0")
+
         name_iid = f"{self._name}.iid:{self._iid}"
 
         (  # initialize by adding the iid and setting the key - zset may be empty
             self._redis.pipeline()  # type: ignore
-            .zadd(self._zset_name, {self._iid: requested_value})
+            .zadd(self._zset_name, {self._iid: score})
             .set(name_iid, 0, px=self._sleepms * 100)
             .execute()
         )

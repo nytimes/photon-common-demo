@@ -7,12 +7,14 @@ from typing import Any, List, TYPE_CHECKING
 if TYPE_CHECKING:
     Queue = queue.Queue
 else:
+
     class FakeGenericMeta(type):
         def __getitem__(self, item):
             return self
 
     class Queue(queue.Queue, metaclass=FakeGenericMeta):
         pass
+
 
 # https://docs.python.org/3/library/queue.html
 @dataclass(order=True)
