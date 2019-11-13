@@ -19,7 +19,7 @@ else:
 # https://docs.python.org/3/library/queue.html
 @dataclass(order=True)
 class ItemDC:
-    priority: float
+    score: float
     data: Any = field(compare=False)
 
 
@@ -27,10 +27,10 @@ class SafePriorityQueue(Queue[ItemDC]):
     """
     A "safe" Priority Queue that insures each item gets popped eventually.
 
-    Each time an item is retrieved the priorities of the remaining items are decreased
+    Each time an item is retrieved the scores of the remaining items are decreased
     by the  "decay" factor; eventually each item will make it to the head of the queue
-    (lowest priority) so no items should "starve" - possibly experiment to get the right
-    decay factor, although the default should work ok.
+    (lowest score, highest priority) so no items should "starve" - possibly experiment
+    to get the right decay factor, although the default should work ok.
 
     """
 
@@ -45,13 +45,14 @@ class SafePriorityQueue(Queue[ItemDC]):
         return len(self.spqueue)
 
     def _put(self, itemdc: ItemDC) -> None:
-        heappush(self.spqueue, itemdc)
+        heappush(self.spqueue, itemdc)  # the heap will rearrange to maintain order
 
     def _get(self) -> ItemDC:
-        head_itemdc = heappop(self.spqueue)
+        head_itemdc = heappop(self.spqueue)  # ditto
 
-        self.spqueue = [
-            ItemDC(priority=self.decay * itemdc.priority, data=itemdc.data)
+        # decay the score of each item - inch toward the head (lowest score)
+        self.spqueue = [  # no need to rearrange the heap - relative order is maintained
+            ItemDC(score=self.decay * itemdc.score, data=itemdc.data)
             for itemdc in self.spqueue
         ]
 

@@ -230,6 +230,7 @@ class Semaphore:
         self._name = name
         self._capacity = paramsnt.capacity
         self._sleepms = paramsnt.sleepms
+        self._timeoutms = paramsnt.timeoutms
         self._zset_name = f"{name}.zset"
         self._iid = str(uuid.uuid1())
         self._acquired_value = 0
@@ -367,7 +368,7 @@ class Semaphore:
         (  # initialize by adding the iid and setting the key - zset may be empty
             self._redis.pipeline()  # type: ignore
             .zadd(self._zset_name, {self._iid: score})
-            .set(name_iid, 0, px=self._sleepms * 100)
+            .set(name_iid, 0, px=self._timeoutms)
             .execute()
         )
 
