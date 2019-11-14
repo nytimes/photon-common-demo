@@ -1,6 +1,6 @@
 import time
 import uuid
-from typing import Any, Callable, Dict, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from redis import Redis
 from redis.exceptions import LockError
@@ -25,6 +25,7 @@ class Semaphore:
 
     Using Redis allows the Semaphore to be shared across all threads,
     processes and machines that connect to the same Redis instance.
+
     """
 
     lua_acquire: Callable = None  # type: ignore
@@ -139,9 +140,10 @@ class Semaphore:
         if name_iid_exists == 0 or not score then    -- oops - app died?
             redis.call("zrem", zset_name, iid)  -- bye bye
             return {-2, 0}  -- raise an exception
+        else  -- we exist! (normal) - extend our life
+            redis.call("pexpire", name_iid, sleepms * 100)
         end
 
-        -- we exist! (normal)
         -- are we at the head of the acquire zset (lowest score)?
         local head_iid = get_zset_entry(name, zset_name, sleepms)
 
@@ -149,7 +151,6 @@ class Semaphore:
             -- reduce our score to avoid starvation and crawl toward the head...
             score = score * decay  -- exponential decay
             redis.call("zadd", zset_name, score, iid)  -- reset
-            redis.call("pexpire", name_iid, sleepms * 100)  -- extend
             return {-1, score}  -- go around again (normal)
         end
 
@@ -254,12 +255,14 @@ class Semaphore:
         paramsbd = redis.hgetall(params_name)  # type: ignore
 
         if paramsbd:
-            paramsd: Dict[str, Any] = {
-                k.decode(): int(v) for k, v in paramsbd.items() if k != b"decay"
-            }
+            paramsnt = ParamsNT(
+                capacity=int(paramsbd[b"capacity"]),
+                timeoutms=int(paramsbd[b"timeoutms"]),
+                sleepms=int(paramsbd[b"sleepms"]),
+                decay=float(paramsbd[b"decay"]),
+            )
 
-            paramsd["decay"] = float(paramsbd[b"decay"])
-            return ParamsNT(**paramsd)
+            return paramsnt
         else:
             return None
 
@@ -268,7 +271,7 @@ class Semaphore:
         redis: Redis,
         name: str = "default",
         capacity: int = 100,
-        timeoutms: int = 60 * 60 * 1000,
+        timeoutms: int = 1 * 60 * 60 * 1000,  # 1 hour
         sleepms: int = 100,
         decay: float = 0.9999,
     ) -> None:
@@ -342,7 +345,7 @@ class Semaphore:
         and return when the semaphore is acquired with the requested value.
 
         Returns:
-            The score incorporating exponential decay.
+            The final score incorporating exponential decay.
 
         Raises:
             LockError.
