@@ -137,11 +137,13 @@ class Semaphore:
         local name_iid_exists = redis.call("exists", name_iid)
 
         -- the existential question
-        if name_iid_exists == 0 or not score then    -- oops - app died?
-            redis.call("zrem", zset_name, iid)  -- bye bye
+        if name_iid_exists == 1 and score then  -- we exist! (normal)
+            redis.call("pexpire", name_iid, 600 * sleepms)  -- extend our life a bit
+        else  -- oops - app died?
+            redis.call("zrem", zset_name, iid)  -- bye bye: remove any traces
+            redis.call("del", name_iid)
+            redis.call("srem", set_name, iid)
             return {-2, 0}  -- raise an exception
-        else  -- we exist! (normal) - extend our life
-            redis.call("pexpire", name_iid, sleepms * 100)
         end
 
         -- are we at the head of the acquire zset (lowest score)?
@@ -300,6 +302,9 @@ class Semaphore:
         if timeoutms < 1:
             raise ValueError("'timeoutms' must be greater than 0")
 
+        if sleepms < 1:
+            raise ValueError("'sleepms' must be greater than 0")
+
         if sleepms >= timeoutms:
             raise ValueError("'sleep' must be less than 'timeout'")
 
@@ -371,7 +376,7 @@ class Semaphore:
         (  # initialize by adding the iid and setting the key - zset may be empty
             self._redis.pipeline()  # type: ignore
             .zadd(self._zset_name, {self._iid: score})
-            .set(name_iid, 0, px=self._timeoutms)
+            .set(name_iid, 0, px=600 * self._sleepms)
             .execute()
         )
 
