@@ -1,3 +1,4 @@
 click>=7.0,<8.0
 time_uuid>=0.2.0
 redis>=3.2.1,<4.0
+redistimeseries>=0.4

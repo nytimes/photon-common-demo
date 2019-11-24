@@ -1,12 +1,86 @@
 import os
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional
 
 from redis import Redis
+from redis.exceptions import ResponseError
+from redistimeseries.client import Client as RedisTS
 
 from photon.common.redis_semaphore import ParamsNT, Semaphore
 from photon.common.config_context_common import ConfigContextCommon
+
+
+class RedisTimeSeriesCommon(object):
+    """
+    Wrapper class for accessing RedisTimeSeries.
+
+    """
+
+    def __init__(self, config: ConfigContextCommon) -> None:
+        """
+        Args:
+            config: A config object.
+        """
+
+        logname = Path(__file__).stem
+        self._logger = logging.getLogger(f"{config.PACKAGE_NAME}.{logname}")
+        redis_host = os.environ.get("REDISHOST", "localhost")
+        redis_port = int(os.environ.get("REDISPORT", 6379))
+        self._redists = RedisTS(host=redis_host, port=redis_port)
+        self._app_key = f"app:{config.PACKAGE_NICKNAME}"
+        self._app = config.PACKAGE_NICKNAME
+        self._name = "A"
+
+    def create(
+        self,
+        name: str = "A",
+        thread: int = 0,
+        retentionms: int = 0,
+        **kwargs: Mapping[str, Any],
+    ) -> None:
+        self._name = name
+        ts = f"ts:{name}.app:{self._app}.T:{thread}"
+        labeld = {"ts": name, "app": self._app, "T": thread}
+        labeld.update(kwargs)
+        print(f"create: {ts}")
+        self._redists.create(ts, retention_msecs=retentionms, labels=labeld)
+
+    def _alter(
+        self,
+        name: str = "A",
+        thread: int = 0,
+        retentionms: int = 0,
+        **kwargs: Mapping[str, Any],
+    ) -> None:
+        self._name = name
+        ts = f"ts:{name}.app:{self._app}.T:{thread}"
+        labeld = {"ts": name, "app": self._app, "T": thread}
+        labeld.update(kwargs)
+        self._redists.alter(ts, retention_msecs=retentionms, labels=labeld)
+
+    def ensure(
+        self,
+        name: str = "A",
+        thread: int = 0,
+        retentionms: int = 0,
+        **kwargs: Mapping[str, Any],
+    ) -> None:
+        try:
+            self.create(name=name, retentionms=retentionms, thread=thread, **kwargs)
+        except ResponseError:
+            self._alter(name=name, retentionms=retentionms, thread=thread, **kwargs)
+
+    def delete(self, name: str = "", thread: int = 0,) -> None:
+        ts = f"ts:{name or self._name}.app:{self._app}.T:{thread}"
+        print(f"delete: {ts}")
+        self._redists.delete(ts)
+
+    def add_value(
+        self, value: int = 0, timestampms: int = 0, name: str = "", thread: int = 0
+    ) -> None:
+        ts = f"ts:{name or self._name}.app:{self._app}.T:{thread}"
+        self._redists.add(ts, timestampms or "*", value)
 
 
 class RedisCommon(object):
