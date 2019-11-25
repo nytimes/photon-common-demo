@@ -83,14 +83,23 @@ class RedisTimeSeriesCommon(object):
         namelist = (",").join(names)
         filters = [f"ts=({namelist})"]
         keys = self._redists.queryindex(filters)
+
         return keys  # type: ignore
 
+    def get_threads_by_name(self, name: str) -> List[int]:
+        filters = [f"ts={name}"]
+        keys = self._redists.queryindex(filters)
+        threads = [int(key.split("T:")[-1]) for key in keys]
+
+        return threads
+
     def get_dataframe(self, key: str) -> pd.DataFrame:
-        tsts = self._redists.range(key, 0, -1)
+        tsts = self._redists.range(key, 0, -1)  # get all datapoints for the key
         tsds = [{"dt": dt, "columns": key, "value": float(value)} for dt, value in tsts]
         tsdf = pd.DataFrame(tsds)
         tsdf["dt"] = pd.to_datetime(tsdf.dt, unit="ms")
         tspivotdf = tsdf.pivot(index="dt", columns="columns", values="value")
+
         return tspivotdf
 
 
