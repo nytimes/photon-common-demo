@@ -1,8 +1,9 @@
 import os
 import logging
 from pathlib import Path
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Sequence
 
+import pandas as pd
 from redis import Redis
 from redis.exceptions import ResponseError
 from redistimeseries.client import Client as RedisTS
@@ -28,8 +29,6 @@ class RedisTimeSeriesCommon(object):
         redis_host = os.environ.get("REDISHOST", "localhost")
         redis_port = int(os.environ.get("REDISPORT", 6379))
         self._redists = RedisTS(host=redis_host, port=redis_port)
-        self._app_key = f"app:{config.PACKAGE_NICKNAME}"
-        self._app = config.PACKAGE_NICKNAME
         self._name = "A"
 
     def create(
@@ -40,11 +39,10 @@ class RedisTimeSeriesCommon(object):
         **kwargs: Mapping[str, Any],
     ) -> None:
         self._name = name
-        ts = f"ts:{name}.app:{self._app}.T:{thread}"
-        labeld = {"ts": name, "app": self._app, "T": thread}
+        key = f"ts:{name}.T:{thread}"
+        labeld = {"ts": name, "T": thread}
         labeld.update(kwargs)
-        print(f"create: {ts}")
-        self._redists.create(ts, retention_msecs=retentionms, labels=labeld)
+        self._redists.create(key, retention_msecs=retentionms, labels=labeld)
 
     def _alter(
         self,
@@ -54,10 +52,10 @@ class RedisTimeSeriesCommon(object):
         **kwargs: Mapping[str, Any],
     ) -> None:
         self._name = name
-        ts = f"ts:{name}.app:{self._app}.T:{thread}"
-        labeld = {"ts": name, "app": self._app, "T": thread}
+        key = f"ts:{name}.T:{thread}"
+        labeld = {"ts": name, "T": thread}
         labeld.update(kwargs)
-        self._redists.alter(ts, retention_msecs=retentionms, labels=labeld)
+        self._redists.alter(key, retention_msecs=retentionms, labels=labeld)
 
     def ensure(
         self,
@@ -71,16 +69,29 @@ class RedisTimeSeriesCommon(object):
         except ResponseError:
             self._alter(name=name, retentionms=retentionms, thread=thread, **kwargs)
 
-    def delete(self, name: str = "", thread: int = 0,) -> None:
-        ts = f"ts:{name or self._name}.app:{self._app}.T:{thread}"
-        print(f"delete: {ts}")
-        self._redists.delete(ts)
+    def delete(self, name: str = "", thread: int = 0) -> None:
+        key = f"ts:{name or self._name}.T:{thread}"
+        self._redists.delete(key)
 
     def add_value(
         self, value: int = 0, timestampms: int = 0, name: str = "", thread: int = 0
     ) -> None:
-        ts = f"ts:{name or self._name}.app:{self._app}.T:{thread}"
-        self._redists.add(ts, timestampms or "*", value)
+        key = f"ts:{name or self._name}.T:{thread}"
+        self._redists.add(key, timestampms or "*", value)
+
+    def get_keys_by_names(self, names: Sequence[str]) -> List[str]:
+        namelist = (",").join(names)
+        filters = [f"ts=({namelist})"]
+        keys = self._redists.queryindex(filters)
+        return keys  # type: ignore
+
+    def get_dataframe(self, key: str) -> pd.DataFrame:
+        tsts = self._redists.range(key, 0, -1)
+        tsds = [{"dt": dt, "columns": key, "value": float(value)} for dt, value in tsts]
+        tsdf = pd.DataFrame(tsds)
+        tsdf["dt"] = pd.to_datetime(tsdf.dt, unit="ms")
+        tspivotdf = tsdf.pivot(index="dt", columns="columns", values="value")
+        return tspivotdf
 
 
 class RedisCommon(object):
