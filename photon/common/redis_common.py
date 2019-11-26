@@ -1,12 +1,11 @@
 import os
 import logging
 from pathlib import Path
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 import pandas as pd
 from redis import Redis
-from redis.exceptions import ResponseError
-from redistimeseries.client import Client as RedisTS
+from redistimeseries.client import Client as RedisTimeSeries
 
 from photon.common.redis_semaphore import ParamsNT, Semaphore
 from photon.common.config_context_common import ConfigContextCommon
@@ -28,8 +27,9 @@ class RedisTimeSeriesCommon(object):
         self._logger = logging.getLogger(f"{config.PACKAGE_NAME}.{logname}")
         redis_host = os.environ.get("REDISHOST", "localhost")
         redis_port = int(os.environ.get("REDISPORT", 6379))
-        self._redists = RedisTS(host=redis_host, port=redis_port)
+        self._rts = RedisTimeSeries(host=redis_host, port=redis_port)
         self._name = "A"
+        self._thread = 0
 
     def create(
         self,
@@ -39,66 +39,49 @@ class RedisTimeSeriesCommon(object):
         **kwargs: Mapping[str, Any],
     ) -> None:
         self._name = name
+        self._thread = thread
         key = f"ts:{name}.T:{thread}"
         labeld = {"ts": name, "T": thread}
         labeld.update(kwargs)
-        self._redists.create(key, retention_msecs=retentionms, labels=labeld)
-
-    def _alter(
-        self,
-        name: str = "A",
-        thread: int = 0,
-        retentionms: int = 0,
-        **kwargs: Mapping[str, Any],
-    ) -> None:
-        self._name = name
-        key = f"ts:{name}.T:{thread}"
-        labeld = {"ts": name, "T": thread}
-        labeld.update(kwargs)
-        self._redists.alter(key, retention_msecs=retentionms, labels=labeld)
-
-    def ensure(
-        self,
-        name: str = "A",
-        thread: int = 0,
-        retentionms: int = 0,
-        **kwargs: Mapping[str, Any],
-    ) -> None:
-        try:
-            self.create(name=name, retentionms=retentionms, thread=thread, **kwargs)
-        except ResponseError:
-            self._alter(name=name, retentionms=retentionms, thread=thread, **kwargs)
+        self._rts.create(key, retention_msecs=retentionms, labels=labeld)
 
     def delete(self, name: str = "", thread: int = 0) -> None:
-        key = f"ts:{name or self._name}.T:{thread}"
-        self._redists.delete(key)
+        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+        self._rts.delete(key)
 
     def add_value(
         self, value: int = 0, timestampms: int = 0, name: str = "", thread: int = 0
     ) -> None:
-        key = f"ts:{name or self._name}.T:{thread}"
-        self._redists.add(key, timestampms or "*", value)
+        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+        self._rts.add(key, timestampms or "*", value)
 
-    def get_keys_by_names(self, names: Sequence[str]) -> List[str]:
+    def get_keytuples_by_names(self, names: Sequence[str]) -> List[Tuple[str, int]]:
         namelist = (",").join(names)
         filters = [f"ts=({namelist})"]
-        keys = self._redists.queryindex(filters)
+        keys = self._rts.queryindex(filters)
 
-        return keys  # type: ignore
+        keytuples = []
+        for key in keys:
+            eles = key.split(".")
+            keytuple = (eles[0].split(":")[-1], int(eles[1].split(":")[-1]))
+            keytuples.append(keytuple)
+
+        return keytuples
 
     def get_threads_by_name(self, name: str) -> List[int]:
         filters = [f"ts={name}"]
-        keys = self._redists.queryindex(filters)
+        keys = self._rts.queryindex(filters)
         threads = [int(key.split("T:")[-1]) for key in keys]
 
         return threads
 
-    def get_dataframe(self, key: str) -> pd.DataFrame:
-        tsts = self._redists.range(key, 0, -1)  # get all datapoints for the key
-        tsds = [{"dt": dt, "columns": key, "value": float(value)} for dt, value in tsts]
+    def get_dataframe(self, name: str, thread: int) -> pd.DataFrame:
+        key = f"ts:{name}.T:{thread}"
+        tsts = self._rts.range(key, 0, -1)  # get all datapoints for the key
+        tsds = [{"dt": dt, "column": key, "value": float(value)} for dt, value in tsts]
         tsdf = pd.DataFrame(tsds)
         tsdf["dt"] = pd.to_datetime(tsdf.dt, unit="ms")
-        tspivotdf = tsdf.pivot(index="dt", columns="columns", values="value")
+        tspivotdf = tsdf.pivot(index="dt", columns="column", values="value")
 
         return tspivotdf
 
