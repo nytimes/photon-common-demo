@@ -1,10 +1,12 @@
 import os
+import time
 import logging
 from pathlib import Path
-from typing import Any, List, Mapping, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 from redis import Redis
+from redis.exceptions import ResponseError
 from redistimeseries.client import Client as RedisTimeSeries
 
 from photon.common.redis_semaphore import ParamsNT, Semaphore
@@ -17,7 +19,14 @@ class RedisTimeSeriesCommon(object):
 
     """
 
-    def __init__(self, config: ConfigContextCommon) -> None:
+    def __init__(
+        self,
+        config: ConfigContextCommon,
+        name: str = "",
+        thread: int = 0,
+        transitionms: int = 0,
+        retentionms: int = 0,
+    ) -> None:
         """
         Args:
             config: A config object.
@@ -28,35 +37,76 @@ class RedisTimeSeriesCommon(object):
         redis_host = os.environ.get("REDISHOST", "localhost")
         redis_port = int(os.environ.get("REDISPORT", 6379))
         self._rts = RedisTimeSeries(host=redis_host, port=redis_port)
-        self._name = "A"
-        self._thread = 0
+        self._name = name or getattr(config, "name", "A")
+        self._thread = thread or getattr(config, "thread", 0)
+        self._transitionms = transitionms or getattr(config, "transitionms", 100)
+
+        self._retentionms = retentionms or getattr(
+            config, "retentionms", 7 * 24 * 60 * 60 * 1000
+        )
+
+        self._previous_value = 0
 
     def create(
         self,
-        name: str = "A",
+        name: str = "",
         thread: int = 0,
+        transitionms: int = 0,
         retentionms: int = 0,
-        **kwargs: Mapping[str, Any],
     ) -> None:
-        self._name = name
-        self._thread = thread
-        key = f"ts:{name}.T:{thread}"
-        labeld = {"ts": name, "T": thread}
-        labeld.update(kwargs)
-        self._rts.create(key, retention_msecs=retentionms, labels=labeld)
+        if name:
+            self._name = name
+
+        if thread:
+            self._thread = thread
+
+        if transitionms:
+            self._transitionms = transitionms
+
+        if retentionms:
+            self._retentionms = retentionms
+
+        key = f"ts:{self._name}.T:{self._thread}"
+        labeld = {"ts": self._name, "T": self._thread}
+        self._rts.create(key, retention_msecs=self._retentionms, labels=labeld)
 
     def delete(self, name: str = "", thread: int = 0) -> None:
         key = f"ts:{name or self._name}.T:{thread or self._thread}"
         self._rts.delete(key)
 
-    def add_value(
-        self, value: int = 0, timestampms: int = 0, name: str = "", thread: int = 0
-    ) -> None:
-        key = f"ts:{name or self._name}.T:{thread or self._thread}"
-        self._rts.add(key, timestampms or "*", value)
+    def _add(self, key: str, value: int) -> None:
+        labeld = {"ts": self._name, "T": self._thread}
 
-    def get_keytuples_by_names(self, names: Sequence[str]) -> List[Tuple[str, int]]:
-        namelist = (",").join(names)
+        i = 0
+        while True:
+            try:
+                self._rts.add(  # use server timestamp
+                    key, "*", value, retention_msecs=self._retentionms, labels=labeld
+                )
+
+                return
+            except ResponseError:  # whoops - too quick, delay a bit
+                if i < 5:
+                    i += 1
+                    time.sleep(0.001)
+                else:
+                    raise
+
+    def add_value(self, value: int = 0, name: str = "", thread: int = 0) -> None:
+        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+
+        if self._transitionms and value != self._previous_value:
+            self._add(key, self._previous_value)
+            time.sleep(self._transitionms / 1000)
+            self._add(key, value)
+            self._previous_value = value
+        else:
+            self._add(key, value)
+
+    def get_keytuples_by_names(
+        self, names: Sequence[str] = []
+    ) -> List[Tuple[str, int]]:
+        namelist = (",").join(names or [self._name])
         filters = [f"ts=({namelist})"]
         keys = self._rts.queryindex(filters)
 
@@ -68,22 +118,25 @@ class RedisTimeSeriesCommon(object):
 
         return keytuples
 
-    def get_threads_by_name(self, name: str) -> List[int]:
-        filters = [f"ts={name}"]
-        keys = self._rts.queryindex(filters)
-        threads = [int(key.split("T:")[-1]) for key in keys]
+    def get_threads_by_name(self, name: str = "") -> Tuple[int, ...]:
+        keytuples = self.get_keytuples_by_names([name or self._name])
+        _, threads = zip(*keytuples)  # discard names
 
         return threads
 
-    def get_dataframe(self, name: str, thread: int) -> pd.DataFrame:
-        key = f"ts:{name}.T:{thread}"
-        tsts = self._rts.range(key, 0, -1)  # get all datapoints for the key
-        tsds = [{"dt": dt, "column": key, "value": float(value)} for dt, value in tsts]
-        tsdf = pd.DataFrame(tsds)
-        tsdf["dt"] = pd.to_datetime(tsdf.dt, unit="ms")
-        tspivotdf = tsdf.pivot(index="dt", columns="column", values="value")
+    def get_dataframe(
+        self, name: str = "", thread: int = 0, timestampms: int = 0
+    ) -> pd.DataFrame:
+        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+        datapointts = self._rts.range(key, timestampms, -1)
 
-        return tspivotdf
+        if not datapointts:
+            return pd.DataFrame()
+
+        dts, values = zip(*datapointts)
+        datapointdf = pd.DataFrame({"dt": dts, key: [float(v) for v in values]})
+        datapointdf["dt"] = pd.to_datetime(datapointdf.dt, unit="ms")
+        return datapointdf.set_index("dt")
 
 
 class RedisCommon(object):
@@ -134,8 +187,8 @@ class RedisCommon(object):
         self,
         name: str = "default",
         capacity: int = 100,
-        timeoutms: int = 60 * 60 * 1000,
-        decay: float = 0.9999,
+        timeoutms: int = 10 * 60 * 1000,
+        decay: float = 0.95,
         sleepms: int = 100,
     ) -> None:
         """
@@ -159,6 +212,6 @@ class RedisCommon(object):
 
         for semaphore in self._semaphores:
             try:
-                semaphore.release()
+                semaphore.failfast()
             except Exception:
                 pass

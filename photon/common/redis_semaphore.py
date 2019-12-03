@@ -1,6 +1,7 @@
 import time
 import uuid
-from typing import Any, Callable, NamedTuple, Optional
+from threading import Thread
+from typing import Any, Callable, List, NamedTuple, Optional
 
 from redis import Redis
 from redis.exceptions import LockError
@@ -16,7 +17,7 @@ class ParamsNT(NamedTuple):
 ParamsNT.capacity.__doc__ = "bool (field 0): The workload capacity of the Semaphore"
 ParamsNT.timeoutms.__doc__ = "bool (field 1): The maximum inactivity in milliseconds."
 ParamsNT.sleepms.__doc__ = "int (field 2): The spin interval in milliseconds"
-ParamsNT.decay.__doc__ = "float (field 3): The decay factor per interval"
+ParamsNT.decay.__doc__ = "float (field 3): The decay factor per timeoutms / 10"
 
 
 class Semaphore:
@@ -30,6 +31,9 @@ class Semaphore:
 
     lua_acquire: Callable = None  # type: ignore
     lua_release: Callable = None  # type: ignore
+    lua_adjust_score: Callable = None  # type: ignore
+    iids: List[str] = []
+    keepalive: bool = False
 
     # KEYS[1] - semaphore name
     # ARGV[1] - semaphore instance id
@@ -61,8 +65,8 @@ class Semaphore:
         local sleepms = tonumber(sleepms_str)
         local decay = tonumber(decay_str)
 
-        local function get_zset_entry(name, zset_name, sleepms)
-            local head_iid = ""
+        local function get_zset_entry(name, zset_name)
+            local head_iid = "None"
             local zset_exists = redis.call("exists", zset_name)
 
             if zset_exists == 1 then
@@ -73,7 +77,7 @@ class Semaphore:
 
                 if head_exists == 0 then  -- oops the head entry has expired - app died?
                     redis.call("zrem", zset_name, head_iid)  -- bye bye
-                    head_iid = ""
+                    head_iid = "Missing"
                 end
             end
 
@@ -129,30 +133,23 @@ class Semaphore:
         end
 
         -- MAIN
-        redis.call("pexpire", zset_name, timeoutms)  -- extend the sorted set
-        redis.call("pexpire", set_name, timeoutms)  -- and the set, if they exist
-
         local score = redis.call("zscore", zset_name, iid)
         local name_iid = name .. ".iid:" .. iid
         local name_iid_exists = redis.call("exists", name_iid)
 
-        -- the existential question
-        if name_iid_exists == 1 and score then  -- we exist! (normal)
-            redis.call("pexpire", name_iid, 600 * sleepms)  -- extend our life a bit
-        else  -- oops - app died?
+        -- the existential question...
+        if name_iid_exists == 0 or not score then  -- oops - app died?
             redis.call("zrem", zset_name, iid)  -- bye bye: remove any traces
             redis.call("del", name_iid)
             redis.call("srem", set_name, iid)
             return {-2, 0}  -- raise an exception
         end
 
+        -- we exist! (normal)
         -- are we at the head of the acquire zset (lowest score)?
-        local head_iid = get_zset_entry(name, zset_name, sleepms)
+        local head_iid = get_zset_entry(name, zset_name)
 
         if iid ~= head_iid then  -- we're not at the head or the head has expired
-            -- reduce our score to avoid starvation and crawl toward the head...
-            score = score * decay  -- exponential decay
-            redis.call("zadd", zset_name, score, iid)  -- reset
             return {-1, score}  -- go around again (normal)
         end
 
@@ -208,6 +205,27 @@ class Semaphore:
         return released_value
     """
 
+    # KEYS[1] - semaphore name
+    # ARGV[1] - instance id
+    LUA_ADJUST_SCORE_SCRIPT = """
+        local name = KEYS[1]
+        local iid = ARGV[1]
+
+        local zset_name = name .. ".zset"
+        local params_name = name .. ".params"
+
+        local decay_str = redis.call("hget", params_name, "decay")
+        local decay = tonumber(decay_str)
+        local score = redis.call("zscore", zset_name, iid)
+
+        if score then  -- reduce score to avoid starvation
+            score = score * decay  -- exponential decay
+            redis.call("zadd", zset_name, score, iid)  -- reset score
+        end
+
+        return score
+    """
+
     def __init__(self, redis: Redis, name: str = "default") -> None:
         """
         Create a new Semaphore instance named ``name`` using the Redis client.
@@ -234,10 +252,13 @@ class Semaphore:
         self._capacity = paramsnt.capacity
         self._sleepms = paramsnt.sleepms
         self._timeoutms = paramsnt.timeoutms
+        self._set_name = f"{name}.set"
         self._zset_name = f"{name}.zset"
         self._iid = str(uuid.uuid1())
+        self._name_iid = f"{name}.iid:{self._iid}"
         self._acquired_value = 0
         self._register_scripts()
+        self._iid_keepalive()
 
     @staticmethod
     def get_params(redis: Redis, name: str = "default") -> Optional[ParamsNT]:
@@ -273,9 +294,9 @@ class Semaphore:
         redis: Redis,
         name: str = "default",
         capacity: int = 100,
-        timeoutms: int = 1 * 60 * 60 * 1000,  # 1 hour
+        timeoutms: int = 10 * 60 * 1000,
         sleepms: int = 100,
-        decay: float = 0.9999,
+        decay: float = 0.95,
     ) -> None:
         """
         Set the params for a Semaphore named ``name``.
@@ -308,8 +329,8 @@ class Semaphore:
         if sleepms >= timeoutms:
             raise ValueError("'sleep' must be less than 'timeout'")
 
-        if decay > 1.0 or decay < 0.999:
-            raise ValueError("'decay' must be between 0.999 and 1.000")
+        if decay > 1.0 or decay < 0.9:
+            raise ValueError("'decay' must be between 0.9 and 1.0")
 
         params_name = f"{name}.params"
 
@@ -335,6 +356,43 @@ class Semaphore:
         if cls.lua_release is None:
             cls.lua_release = self._redis.register_script(self.LUA_RELEASE_SCRIPT)
 
+        if cls.lua_adjust_score is None:
+            cls.lua_adjust_score = self._redis.register_script(
+                self.LUA_ADJUST_SCORE_SCRIPT
+            )
+
+    def _keepalive(self) -> None:
+        """
+        Keepalive for the class running in a daemon thread; also adjusts scores.
+
+        """
+        cls = self.__class__
+
+        while True:  # extend the expirations for data structures if they exist
+            time.sleep(self._timeoutms / 1000 / 10)
+            self._redis.pexpire(self._set_name, self._timeoutms)  # type: ignore
+            self._redis.pexpire(self._zset_name, self._timeoutms)  # type: ignore
+
+            for iid in cls.iids:  # extend each name_iid key/value if it exists
+                name_iid = f"{self._name}.iid:{iid}"
+                self._redis.pexpire(name_iid, self._timeoutms)  # type: ignore
+
+                self.lua_adjust_score(
+                    keys=[self._name], args=[iid], client=self._redis
+                )
+
+    def _iid_keepalive(self) -> None:
+        """
+        Record the current iid; start a daemon keepalive thread for the class.
+
+        """
+        cls = self.__class__
+        cls.iids.append(self._iid)
+
+        if not cls.keepalive:  # first instance to get here will run the keepalive
+            cls.keepalive = True
+            Thread(target=self._keepalive, daemon=True).start()
+
     def __enter__(self, **kwargs: Any) -> object:
         if self.acquire(**kwargs):
             return self
@@ -346,7 +404,7 @@ class Semaphore:
 
     def acquire(self, requested_value: int = 1, score: float = 0.0) -> float:
         """
-        Use Redis to acquire a shared, distributed semaphore for this instanec_id
+        Use Redis to acquire a shared, distributed semaphore for this instance_id
         and return when the semaphore is acquired with the requested value.
 
         Returns:
@@ -371,12 +429,11 @@ class Semaphore:
         if score < 0:
             raise ValueError("'score' must be >= 0")
 
-        name_iid = f"{self._name}.iid:{self._iid}"
-
-        (  # initialize by adding the iid and setting the key - zset may be empty
+        (  # initialize by adding the iid to zset; set the name_iid key/value to 0
             self._redis.pipeline()  # type: ignore
             .zadd(self._zset_name, {self._iid: score})
-            .set(name_iid, 0, px=600 * self._sleepms)
+            .pexpire(self._zset_name, self._timeoutms)  # may have been created
+            .set(self._name_iid, 0, px=self._timeoutms)
             .execute()
         )
 
@@ -419,3 +476,19 @@ class Semaphore:
         self._acquired_value = 0
 
         return int(released_value)
+
+    def failfast(self) -> None:
+        """
+        Delete instance data structures.
+
+        """
+        try:
+            (
+                self._redis.pipeline()  # type: ignore
+                .delete(self._name_iid)
+                .srem(self._set_name, self._iid)
+                .zrem(self._zset_name, self._iid)
+                .execute()
+            )
+        except Exception:
+            pass
