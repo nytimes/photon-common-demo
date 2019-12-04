@@ -1,11 +1,13 @@
 import os
 import time
+import pickle
 import logging
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, NamedTuple, Optional, Sequence, Tuple
 
 import pandas as pd
 from redis import Redis
+from time_uuid import TimeUUID
 from redis.exceptions import ResponseError
 from redistimeseries.client import Client as RedisTimeSeries
 
@@ -139,6 +141,22 @@ class RedisTimeSeriesCommon(object):
         return datapointdf.set_index("dt")
 
 
+class RedisWorkNT(NamedTuple):
+    """
+    Work info submitted to Incoming via Redis.
+
+    """
+
+    workload: int
+    workid: TimeUUID
+    runtuuid: TimeUUID
+
+
+RedisWorkNT.workload.__doc__ = "int (field 0): The work resources required."
+RedisWorkNT.workid.__doc__ = "TimeUUID (field 1): The tuuid for the work to be done."
+RedisWorkNT.workload.__doc__ = "TimeUUID (field 2): The tuuid of the submitting run."
+
+
 class RedisCommon(object):
     """
     Wrapper class for accessing Redis.
@@ -203,6 +221,48 @@ class RedisCommon(object):
             sleepms=sleepms,
             decay=decay,
         )
+
+    def publish_redis_worknt(
+        self, redis_worknt: RedisWorkNT, name: str = "default"
+    ) -> None:
+        """
+        Queue a RedisWorkNT.
+
+        The RedisWorkNT NamedTuple is pickled.
+
+        Args:
+            The RedisWorkNT.
+
+        Raises:
+            RunTimeError if no subscriber.
+        """
+        awf_key = f"{self._app_key}.workflow:{name}"
+        redis_worknt_pkl = pickle.dumps(redis_worknt)
+
+        if not self._redis.publish(awf_key, redis_worknt_pkl):
+            raise RuntimeError(f"No subscriber to '{awf_key}'")
+
+    def snapshot_workq(self, items: Sequence[Any], name: str = "A") -> None:
+        tssnap_key = f"ts:{name}.snap:workq"
+        item_pkls = [pickle.dumps(item) for item in items]
+        item_pkls.reverse()
+
+        if items:
+            (
+                self._redis.pipeline()  # type: ignore
+                .delete(tssnap_key)
+                .lpush(tssnap_key, *item_pkls)
+                .execute()
+            )
+        else:
+            self._redis.delete(tssnap_key)  # type: ignore
+
+    def get_snapshot_workq(self, name: str = "A") -> List[Any]:
+        tssnap_key = f"ts:{name}.snap:workq"
+        item_pkls = self._redis.lrange(tssnap_key, 0, -1)
+        items = [pickle.loads(item_pkl) for item_pkl in item_pkls]
+
+        return items
 
     def failfast(self) -> None:
         """

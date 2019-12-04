@@ -39,21 +39,21 @@ class SafePriorityQueue(Queue[ItemDC]):
         self._decay = decay
 
     def _init(self, maxsize: int) -> None:
-        self.spqueue: List[ItemDC] = []
+        self.queue: List[ItemDC] = []
 
     def _qsize(self) -> int:
-        return len(self.spqueue)
+        return len(self.queue)
 
     def _put(self, itemdc: ItemDC) -> None:
-        heappush(self.spqueue, itemdc)  # the heap will rearrange to maintain order
+        heappush(self.queue, itemdc)  # the heap will rearrange to maintain order
 
     def _get(self) -> ItemDC:
-        head_itemdc = heappop(self.spqueue)  # ditto
+        head_itemdc = heappop(self.queue)  # ditto
 
         # decay the score of each item - creep toward the head (lowest score)
-        self.spqueue = [  # no need to rearrange the heap - relative order is maintained
+        self.queue = [  # no need to rearrange the heap - relative order is maintained
             ItemDC(score=self._decay * itemdc.score, data=itemdc.data)
-            for itemdc in self.spqueue
+            for itemdc in self.queue
         ]
 
         return head_itemdc
