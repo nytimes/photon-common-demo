@@ -242,7 +242,9 @@ class RedisCommon(object):
         if not self._redis.publish(awf_key, redis_worknt_pkl):
             raise RuntimeError(f"No subscriber to '{awf_key}'")
 
-    def snapshot_workq(self, items: Sequence[Any], name: str = "A") -> None:
+    def snapshot_workq(
+        self, items: Sequence[Any], name: str = "A", timeoutms: int = 10 * 60 * 1000
+    ) -> None:
         tssnap_key = f"ts:{name}.snap:workq"
         item_pkls = [pickle.dumps(item) for item in items]
         item_pkls.reverse()
@@ -252,6 +254,7 @@ class RedisCommon(object):
                 self._redis.pipeline()  # type: ignore
                 .delete(tssnap_key)
                 .lpush(tssnap_key, *item_pkls)
+                .pexpire(tssnap_key, timeoutms)
                 .execute()
             )
         else:
@@ -259,7 +262,7 @@ class RedisCommon(object):
 
     def get_snapshot_workq(self, name: str = "A") -> List[Any]:
         tssnap_key = f"ts:{name}.snap:workq"
-        item_pkls = self._redis.lrange(tssnap_key, 0, -1)
+        item_pkls = self._redis.lrange(tssnap_key, 0, -1)  # type: ignore
         items = [pickle.loads(item_pkl) for item_pkl in item_pkls]
 
         return items

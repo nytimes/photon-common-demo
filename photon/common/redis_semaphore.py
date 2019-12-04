@@ -376,10 +376,7 @@ class Semaphore:
             for iid in cls.iids:  # extend each name_iid key/value if it exists
                 name_iid = f"{self._name}.iid:{iid}"
                 self._redis.pexpire(name_iid, self._timeoutms)  # type: ignore
-
-                self.lua_adjust_score(
-                    keys=[self._name], args=[iid], client=self._redis
-                )
+                self.lua_adjust_score(keys=[self._name], args=[iid], client=self._redis)
 
     def _iid_keepalive(self) -> None:
         """
