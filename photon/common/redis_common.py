@@ -129,7 +129,7 @@ class RedisTimeSeriesCommon(object):
         return timestampms
 
     def get_keytuples_by_names(
-        self, names: Sequence[str] = []
+        self, names: Sequence[str] = [], types: Sequence[str] = ["T"]
     ) -> List[Tuple[str, int]]:
         namelist = (",").join(names or [self._name])
         filters = [f"ts=({namelist})"]
@@ -138,21 +138,31 @@ class RedisTimeSeriesCommon(object):
         keytuples = []
         for key in keys:
             eles = key.split(".")
-            keytuple = (eles[0].split(":")[-1], int(eles[1].split(":")[-1]))
-            keytuples.append(keytuple)
+            ele0 = eles[0].split(":")  # ("ts", <name>)
+            ele1 = eles[1].split(":")  # ("T" or "S", <int>)
+            keytuple = (ele0[1], int(ele1[1]))  # (<name>, <int>)
+
+            if ele1[0] in types:
+                keytuples.append(keytuple)
 
         return keytuples
 
     def get_threads_by_name(self, name: str = "") -> Tuple[int, ...]:
-        keytuples = self.get_keytuples_by_names([name or self._name])
-        _, threads = zip(*keytuples)  # discard names
+        keytuples = self.get_keytuples_by_names([name or self._name], types=["T"])
+        names, threads = zip(*keytuples)
 
-        return threads
+        return threads  # discard names
+
+    def get_slots_by_name(self, name: str = "") -> Tuple[int, ...]:
+        keytuples = self.get_keytuples_by_names([name or self._name], types=["S"])
+        names, slots = zip(*keytuples)
+
+        return slots  # discard names
 
     def get_dataframe(
-        self, name: str = "", thread: int = 0, timestampms: int = 0
+        self, name: str = "", thread: int = 0, timestampms: int = 0, type: str = "T"
     ) -> pd.DataFrame:
-        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+        key = f"ts:{name or self._name}.{type}:{thread or self._thread}"
         datapointts = self._rts.range(key, timestampms, -1)
 
         if not datapointts:
