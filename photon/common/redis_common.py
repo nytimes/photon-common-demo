@@ -3,7 +3,7 @@ import time
 import pickle
 import logging
 from pathlib import Path
-from typing import Any, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 from redis import Redis
@@ -76,17 +76,25 @@ class RedisTimeSeriesCommon(object):
         key = f"ts:{name or self._name}.T:{thread or self._thread}"
         self._rts.delete(key)
 
-    def _add(self, key: str, value: int) -> None:
-        labeld = {"ts": self._name, "T": self._thread}
-
+    def _add_value(
+        self,
+        key: str,
+        timestampms: Union[int, str],
+        value: int,
+        labeld: Mapping[str, Any],
+    ) -> int:
         i = 0
         while True:
             try:
-                self._rts.add(  # use server timestamp
-                    key, "*", value, retention_msecs=self._retentionms, labels=labeld
+                timestampms_return = self._rts.add(
+                    key,
+                    timestampms,
+                    value,
+                    retention_msecs=self._retentionms,
+                    labels=labeld,
                 )
 
-                return
+                return timestampms_return  # type: ignore
             except ResponseError:  # whoops - too quick, delay a bit
                 if i < 5:
                     i += 1
@@ -96,14 +104,29 @@ class RedisTimeSeriesCommon(object):
 
     def add_value(self, value: int = 0, name: str = "", thread: int = 0) -> None:
         key = f"ts:{name or self._name}.T:{thread or self._thread}"
+        labeld = {"ts": name or self._name, "T": thread or self._thread}
 
         if self._transitionms and value != self._previous_value:
-            self._add(key, self._previous_value)
+            self._add_value(key, "*", self._previous_value, labeld)
             time.sleep(self._transitionms / 1000)
-            self._add(key, value)
+            self._add_value(key, "*", value, labeld)
             self._previous_value = value
         else:
-            self._add(key, value)
+            self._add_value(key, "*", value, labeld)
+
+    def add_slot_values(self, values: Sequence[int] = [], name: str = "") -> int:
+        if not values:
+            return 0
+
+        keybase = f"ts:{name or self._name}.S:"
+        labeld = {"ts": name or self._name, "S": 0}
+        timestampms = self._add_value(f"{keybase}0", "*", values[0], labeld)
+
+        for i, value in enumerate(values[1:]):
+            labeld["S"] = i + 1
+            self._add_value(f"{keybase}{i + 1}", timestampms, value, labeld)
+
+        return timestampms
 
     def get_keytuples_by_names(
         self, names: Sequence[str] = []
