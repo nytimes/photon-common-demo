@@ -68,12 +68,17 @@ class RedisTimeSeriesCommon(object):
         if retentionms:
             self._retentionms = retentionms
 
-        key = f"ts:{self._name}.T:{self._thread}"
+        key = f"ts:{self._name}.T:{self._thread:03d}"
         labeld = {"ts": self._name, "T": self._thread}
         self._rts.create(key, retention_msecs=self._retentionms, labels=labeld)
 
     def delete(self, name: str = "", thread: int = 0) -> None:
-        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+        key = f"ts:{name or self._name}.T:{thread or self._thread:03d}"
+        self._rts.delete(key)
+
+    # slots are created dynamically but every now and then we want to delete one
+    def delete_slot(self, name: str = "", slot: int = 0) -> None:
+        key = f"ts:{name or self._name}.S:{slot:03d}"
         self._rts.delete(key)
 
     def _add_value(
@@ -102,29 +107,31 @@ class RedisTimeSeriesCommon(object):
                 else:
                     raise
 
-    def add_value(self, value: int = 0, name: str = "", thread: int = 0) -> None:
-        key = f"ts:{name or self._name}.T:{thread or self._thread}"
+    def add_value(self, value: int = 0, name: str = "", thread: int = 0) -> int:
+        key = f"ts:{name or self._name}.T:{thread or self._thread:03d}"
         labeld = {"ts": name or self._name, "T": thread or self._thread}
 
         if self._transitionms and value != self._previous_value:
-            self._add_value(key, "*", self._previous_value, labeld)
+            timestampms_return = self._add_value(key, "*", self._previous_value, labeld)
             time.sleep(self._transitionms / 1000)
             self._add_value(key, "*", value, labeld)
             self._previous_value = value
+            return timestampms_return
         else:
-            self._add_value(key, "*", value, labeld)
+            return self._add_value(key, "*", value, labeld)
 
     def add_slot_values(self, values: Sequence[int] = [], name: str = "") -> int:
         if not values:
-            return 0
+            values = [0]
 
         keybase = f"ts:{name or self._name}.S:"
         labeld = {"ts": name or self._name, "S": 0}
-        timestampms = self._add_value(f"{keybase}0", "*", values[0], labeld)
+        timestampms = self._add_value(f"{keybase}000", "*", values[0], labeld)
 
         for i, value in enumerate(values[1:]):
-            labeld["S"] = i + 1
-            self._add_value(f"{keybase}{i + 1}", timestampms, value, labeld)
+            j = i + 1
+            labeld["S"] = j
+            self._add_value(f"{keybase}{j:03d}", timestampms, value, labeld)
 
         return timestampms
 
@@ -138,11 +145,11 @@ class RedisTimeSeriesCommon(object):
         keytuples = []
         for key in keys:
             eles = key.split(".")
-            ele0 = eles[0].split(":")  # ("ts", <name>)
-            ele1 = eles[1].split(":")  # ("T" or "S", <int>)
-            keytuple = (ele0[1], int(ele1[1]))  # (<name>, <int>)
+            _, name = eles[0].split(":")  # ("ts", <name>)
+            mytype, value = eles[1].split(":")  # ("T" or "S", <str number>)
+            keytuple = (name, int(value))  # (<name>, <int>)
 
-            if ele1[0] in types:
+            if mytype in types:
                 keytuples.append(keytuple)
 
         return keytuples
@@ -160,9 +167,23 @@ class RedisTimeSeriesCommon(object):
         return slots  # discard names
 
     def get_dataframe(
-        self, name: str = "", thread: int = 0, timestampms: int = 0, type: str = "T"
+        self, name: str = "", thread: int = 0, timestampms: int = 0
     ) -> pd.DataFrame:
-        key = f"ts:{name or self._name}.{type}:{thread or self._thread}"
+        key = f"ts:{name or self._name}.T:{thread or self._thread:03d}"
+        datapointts = self._rts.range(key, timestampms, -1)
+
+        if not datapointts:
+            return pd.DataFrame()
+
+        dts, values = zip(*datapointts)
+        datapointdf = pd.DataFrame({"dt": dts, key: [float(v) for v in values]})
+        datapointdf["dt"] = pd.to_datetime(datapointdf.dt, unit="ms")
+        return datapointdf.set_index("dt")
+
+    def get_slot_dataframe(
+        self, name: str = "", slot: int = 0, timestampms: int = 0
+    ) -> pd.DataFrame:
+        key = f"ts:{name or self._name}.S:{slot:03d}"
         datapointts = self._rts.range(key, timestampms, -1)
 
         if not datapointts:
