@@ -76,7 +76,7 @@ class RedisTimeSeriesCommon(object):
         key = f"ts:{name or self._name}.T:{thread or self._thread:03d}"
         self._rts.delete(key)
 
-    # slots are created dynamically but every now and then we want to delete one
+    # slots are created dynamically and every now and then we want to delete
     def delete_slot(self, name: str = "", slot: int = 0) -> None:
         key = f"ts:{name or self._name}.S:{slot:03d}"
         self._rts.delete(key)
@@ -100,8 +100,8 @@ class RedisTimeSeriesCommon(object):
                 )
 
                 return timestampms_return  # type: ignore
-            except ResponseError:  # whoops - too quick, delay a bit
-                if i < 5:
+            except ResponseError:  # too quick, delay a bit if using server timestamp
+                if i < 5 and timestampms == "*":
                     i += 1
                     time.sleep(0.001)
                 else:
