@@ -195,22 +195,6 @@ class RedisTimeSeriesCommon(object):
         return datapointdf.set_index("dt")
 
 
-class RedisWorkNT(NamedTuple):
-    """
-    Work info submitted to Incoming via Redis.
-
-    """
-
-    workload: int
-    workid: TimeUUID
-    runtuuid: TimeUUID
-
-
-RedisWorkNT.workload.__doc__ = "int (field 0): The work resources required."
-RedisWorkNT.workid.__doc__ = "TimeUUID (field 1): The tuuid for the work to be done."
-RedisWorkNT.workload.__doc__ = "TimeUUID (field 2): The tuuid of the submitting run."
-
-
 class RedisCommon(object):
     """
     Wrapper class for accessing Redis.
@@ -275,26 +259,6 @@ class RedisCommon(object):
             sleepms=sleepms,
             decay=decay,
         )
-
-    def publish_redis_worknt(
-        self, redis_worknt: RedisWorkNT, name: str = "default"
-    ) -> None:
-        """
-        Queue a RedisWorkNT.
-
-        The RedisWorkNT NamedTuple is pickled.
-
-        Args:
-            The RedisWorkNT.
-
-        Raises:
-            RunTimeError if no subscriber.
-        """
-        awf_key = f"{self._app_key}.workflow:{name}"
-        redis_worknt_pkl = pickle.dumps(redis_worknt)
-
-        if not self._redis.publish(awf_key, redis_worknt_pkl):
-            raise RuntimeError(f"No subscriber to '{awf_key}'")
 
     def failfast(self) -> None:
         """
